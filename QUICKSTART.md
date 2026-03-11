@@ -97,3 +97,9 @@ In the terminal window running Streamlit, press `Ctrl + C`.
 ## 10. Backup tip
 
 Back up the `data/` folder regularly so trade history is never lost.
+
+## 11. Optional: auto refresh every weekday
+
+If you want daily updates without opening the app, follow:
+
+- [SCHEDULER.md](SCHEDULER.md)

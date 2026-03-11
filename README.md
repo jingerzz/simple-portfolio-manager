@@ -31,6 +31,7 @@ Simple investing tracker for kids with chat-style trade entry and local CSV stor
 ## Quick start
 
 For a parent/kid-friendly walkthrough, see [QUICKSTART.md](QUICKSTART.md).
+For automatic daily updates, see [SCHEDULER.md](SCHEDULER.md).
 
 1. Create a virtual environment and install dependencies:
    ```bash
@@ -55,3 +56,4 @@ CSV files are created automatically in `data/`:
 
 - Educational tool only; not investment advice.
 - `yfinance` is free and convenient but has no uptime/data SLA.
+- Scheduled refresh runner is available at `scripts/daily_refresh.py`.
