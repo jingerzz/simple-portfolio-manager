@@ -13,6 +13,7 @@ EPSILON = 1e-9
 class PositionAccumulator:
     shares: float = 0.0
     total_cost: float = 0.0
+    realized_pnl: float = 0.0
 
 
 def compute_position_states(trades_df: pd.DataFrame) -> Dict[Tuple[str, str], PositionAccumulator]:
@@ -41,12 +42,20 @@ def compute_position_states(trades_df: pd.DataFrame) -> Dict[Tuple[str, str], Po
             continue
 
         if action == "SELL":
-            if state.shares <= EPSILON:
+            if state.shares <= EPSILON or shares <= EPSILON:
                 continue
+
             shares_to_sell = min(shares, state.shares)
             average_cost = state.total_cost / state.shares if state.shares > EPSILON else 0.0
+            cost_removed = average_cost * shares_to_sell
+            fee_allocated = fees * (shares_to_sell / shares) if shares > EPSILON else 0.0
+            proceeds = (shares_to_sell * price) - fee_allocated
+
+            state.realized_pnl += proceeds - cost_removed
             state.shares -= shares_to_sell
-            state.total_cost -= average_cost * shares_to_sell
+            state.total_cost -= cost_removed
+            if state.total_cost < EPSILON:
+                state.total_cost = 0.0
             if state.shares <= EPSILON:
                 state.shares = 0.0
                 state.total_cost = 0.0
@@ -54,10 +63,16 @@ def compute_position_states(trades_df: pd.DataFrame) -> Dict[Tuple[str, str], Po
     return states
 
 
-def get_current_shares(trades_df: pd.DataFrame, kid: str, ticker: str) -> float:
+def get_position_state(trades_df: pd.DataFrame, kid: str, ticker: str) -> PositionAccumulator:
     key = (kid.strip(), ticker.strip().upper())
     state = compute_position_states(trades_df).get(key)
-    return state.shares if state else 0.0
+    if state is None:
+        return PositionAccumulator()
+    return state
+
+
+def get_current_shares(trades_df: pd.DataFrame, kid: str, ticker: str) -> float:
+    return get_position_state(trades_df, kid, ticker).shares
 
 
 def build_positions(
@@ -90,6 +105,7 @@ def build_positions(
                 "market_price": market_price,
                 "market_value": market_value,
                 "unrealized_pnl": unrealized,
+                "realized_pnl": state.realized_pnl,
                 "pnl_pct": pnl_pct,
             }
         )
@@ -132,13 +148,23 @@ def build_daily_snapshots(
     return pd.DataFrame(rows, columns=SNAPSHOT_COLUMNS)
 
 
-def portfolio_summary_for_kid(positions_df: pd.DataFrame, kid: str) -> dict:
+def portfolio_summary_for_kid(
+    positions_df: pd.DataFrame,
+    kid: str,
+    trades_df: Optional[pd.DataFrame] = None,
+) -> dict:
     if positions_df.empty:
-        return _empty_summary()
+        summary = _empty_summary()
+        summary["realized_pnl"] = realized_pnl_for_kid(trades_df, kid) if trades_df is not None else 0.0
+        summary["total_pnl"] = summary["unrealized_pnl"] + summary["realized_pnl"]
+        return summary
 
     filtered = positions_df.loc[positions_df["kid"] == kid]
     if filtered.empty:
-        return _empty_summary()
+        summary = _empty_summary()
+        summary["realized_pnl"] = realized_pnl_for_kid(trades_df, kid) if trades_df is not None else 0.0
+        summary["total_pnl"] = summary["unrealized_pnl"] + summary["realized_pnl"]
+        return summary
 
     shares = pd.to_numeric(filtered["shares"], errors="coerce").fillna(0.0)
     avg_cost = pd.to_numeric(filtered["avg_cost"], errors="coerce").fillna(0.0)
@@ -148,11 +174,14 @@ def portfolio_summary_for_kid(positions_df: pd.DataFrame, kid: str) -> dict:
     total_value = float(market_value.sum())
     unrealized = total_value - total_cost
     pnl_pct = (unrealized / total_cost * 100.0) if total_cost > EPSILON else 0.0
+    realized = realized_pnl_for_kid(trades_df, kid) if trades_df is not None else 0.0
 
     return {
         "total_cost": total_cost,
         "total_value": total_value,
         "unrealized_pnl": unrealized,
+        "realized_pnl": realized,
+        "total_pnl": unrealized + realized,
         "pnl_pct": pnl_pct,
     }
 
@@ -205,6 +234,67 @@ def recent_trades_for_kid(trades_df: pd.DataFrame, kid: str, limit: int) -> pd.D
     return ordered.head(limit).reset_index(drop=True)
 
 
+def realized_pnl_for_kid(trades_df: Optional[pd.DataFrame], kid: str) -> float:
+    if trades_df is None or trades_df.empty:
+        return 0.0
+
+    normalized_kid = kid.strip()
+    states = compute_position_states(trades_df)
+    total = 0.0
+    for (state_kid, _ticker), state in states.items():
+        if state_kid == normalized_kid:
+            total += state.realized_pnl
+    return float(total)
+
+
+def realized_pnl_for_ticker(trades_df: Optional[pd.DataFrame], kid: str, ticker: str) -> float:
+    if trades_df is None or trades_df.empty:
+        return 0.0
+
+    key = (kid.strip(), ticker.strip().upper())
+    state = compute_position_states(trades_df).get(key)
+    if state is None:
+        return 0.0
+    return float(state.realized_pnl)
+
+
+def ticker_performance_for_kid(
+    trades_df: Optional[pd.DataFrame],
+    positions_df: pd.DataFrame,
+    kid: str,
+    ticker: str,
+) -> Optional[dict]:
+    normalized_ticker = ticker.upper().strip()
+    open_position = ticker_position_for_kid(positions_df, kid, normalized_ticker)
+    realized = realized_pnl_for_ticker(trades_df, kid, normalized_ticker)
+
+    if open_position is None and abs(realized) <= EPSILON:
+        return None
+
+    if open_position is None:
+        open_position = {
+            "ticker": normalized_ticker,
+            "shares": 0.0,
+            "avg_cost": 0.0,
+            "market_price": float("nan"),
+            "market_value": 0.0,
+            "unrealized_pnl": 0.0,
+            "pnl_pct": 0.0,
+        }
+        has_open_position = False
+    else:
+        has_open_position = open_position["shares"] > EPSILON
+
+    unrealized = open_position["unrealized_pnl"]
+    if pd.isna(unrealized):
+        unrealized = 0.0
+
+    open_position["realized_pnl"] = realized
+    open_position["total_pnl"] = float(realized + unrealized)
+    open_position["has_open_position"] = has_open_position
+    return open_position
+
+
 def _latest_price_map(latest_prices_df: pd.DataFrame) -> Dict[str, float]:
     if latest_prices_df.empty:
         return {}
@@ -237,5 +327,7 @@ def _empty_summary() -> dict:
         "total_cost": 0.0,
         "total_value": 0.0,
         "unrealized_pnl": 0.0,
+        "realized_pnl": 0.0,
+        "total_pnl": 0.0,
         "pnl_pct": 0.0,
     }

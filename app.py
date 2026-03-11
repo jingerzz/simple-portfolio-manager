@@ -1,5 +1,4 @@
 from datetime import date, datetime, timezone
-from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -28,6 +27,38 @@ def init_session_state() -> None:
         st.session_state.active_kid = st.session_state.kid_options[0]
     if "auto_refresh_done" not in st.session_state:
         st.session_state.auto_refresh_done = False
+
+
+def inject_global_styles() -> None:
+    st.markdown(
+        """
+        <style>
+            div.stButton > button {
+                width: 100%;
+                min-height: 2.95rem;
+                font-size: 1.02rem;
+                font-weight: 700;
+                border-radius: 10px;
+            }
+            div[data-testid="stChatInput"] textarea {
+                font-size: 1.02rem;
+            }
+            .pending-trade-card {
+                border: 1px solid #d1d5db;
+                border-radius: 12px;
+                padding: 0.8rem 0.9rem;
+                margin: 0.25rem 0 0.75rem 0;
+                background: #f8fafc;
+            }
+            .quick-hint {
+                font-size: 0.95rem;
+                color: #374151;
+                margin-bottom: 0.35rem;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def add_chat_message(role: str, content: str) -> None:
@@ -75,7 +106,18 @@ def refresh_prices(tickers: list[str]) -> str:
     if records:
         storage.append_prices(records)
 
+    if not records and missing:
+        return f"I could not fetch prices for: {', '.join(missing)}."
+
+    sources = {}
+    for row in records:
+        source = str(row.get("source", "unknown"))
+        sources[source] = sources.get(source, 0) + 1
+
     parts = [f"Updated {len(records)} ticker(s)."]
+    if sources:
+        source_text = ", ".join(f"{name}: {count}" for name, count in sorted(sources.items()))
+        parts.append(f"Sources used: {source_text}.")
     if missing:
         parts.append(f"Missing data for: {', '.join(missing)}.")
     return " ".join(parts)
@@ -87,13 +129,19 @@ def commit_pending_trade() -> str:
         return "There is no pending trade to confirm."
 
     trades_df = storage.load_trades()
+    sell_realized = None
     if pending["action"] == "SELL":
-        available = engine.get_current_shares(trades_df, pending["kid"], pending["ticker"])
+        state = engine.get_position_state(trades_df, pending["kid"], pending["ticker"])
+        available = state.shares
         if pending["shares"] > available + 1e-9:
             return (
                 f"I could not record that sell. {pending['kid']} only has "
                 f"{available:.4f} shares of {pending['ticker']}."
             )
+        average_cost = state.total_cost / state.shares if state.shares > 1e-9 else 0.0
+        cost_removed = average_cost * pending["shares"]
+        proceeds = (pending["shares"] * pending["price"]) - pending["fees"]
+        sell_realized = proceeds - cost_removed
 
     row = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -108,10 +156,13 @@ def commit_pending_trade() -> str:
     }
     storage.append_trade(row)
     st.session_state.pending_trade = None
-    return (
+    message = (
         f"Recorded {row['action']} {row['shares']:.4f} {row['ticker']} @ "
         f"${row['price']:.2f} for {row['kid']}."
     )
+    if sell_realized is not None:
+        message += f" Realized P&L on this sell: {money(sell_realized)}."
+    return message
 
 
 def process_user_message(
@@ -160,26 +211,39 @@ def process_user_message(
         return "\n".join(lines)
 
     if parser.is_portfolio_query(message):
-        summary = engine.portfolio_summary_for_kid(positions_df, active_kid)
+        summary = engine.portfolio_summary_for_kid(positions_df, active_kid, trades_df)
         return (
             f"{active_kid} portfolio:\n"
             f"- Total Cost: {money(summary['total_cost'])}\n"
             f"- Current Value: {money(summary['total_value'])}\n"
-            f"- Unrealized P&L: {money(summary['unrealized_pnl'])} ({summary['pnl_pct']:+.2f}%)"
+            f"- Unrealized P&L: {money(summary['unrealized_pnl'])} ({summary['pnl_pct']:+.2f}%)\n"
+            f"- Realized P&L: {money(summary['realized_pnl'])}\n"
+            f"- Total P&L: {money(summary['total_pnl'])}"
         )
 
     pnl_ticker = parser.extract_pnl_ticker(message)
     if pnl_ticker:
-        detail = engine.ticker_position_for_kid(positions_df, active_kid, pnl_ticker)
+        detail = engine.ticker_performance_for_kid(trades_df, positions_df, active_kid, pnl_ticker)
         if detail is None:
-            return f"{active_kid} has no open position in {pnl_ticker}."
+            return f"{active_kid} has no trade history for {pnl_ticker}."
+
+        if not detail["has_open_position"]:
+            return (
+                f"{active_kid} {pnl_ticker}:\n"
+                "- No open position right now.\n"
+                f"- Realized P&L: {money(detail['realized_pnl'])}\n"
+                f"- Total P&L: {money(detail['total_pnl'])}"
+            )
+
         market_price = "N/A" if pd.isna(detail["market_price"]) else money(detail["market_price"])
         return (
             f"{active_kid} {pnl_ticker}:\n"
             f"- Shares: {detail['shares']:.4f}\n"
             f"- Avg Cost: {money(detail['avg_cost'])}\n"
             f"- Market Price: {market_price}\n"
-            f"- Unrealized P&L: {money(detail['unrealized_pnl'])} ({detail['pnl_pct']:+.2f}%)"
+            f"- Unrealized P&L: {money(detail['unrealized_pnl'])} ({detail['pnl_pct']:+.2f}%)\n"
+            f"- Realized P&L: {money(detail['realized_pnl'])}\n"
+            f"- Total P&L: {money(detail['total_pnl'])}"
         )
 
     trade = parser.parse_trade_message(message)
@@ -218,13 +282,13 @@ def process_user_message(
         }
         pending = st.session_state.pending_trade
         return (
-            "Please confirm this trade:\n"
+            "Pending trade ready for review:\n"
             f"- Kid: {pending['kid']}\n"
             f"- Action: {pending['action']}\n"
             f"- Ticker: {pending['ticker']}\n"
             f"- Shares: {pending['shares']:.4f}\n"
             f"- Price: ${pending['price']:.2f}\n"
-            "Click the confirm button below or type `confirm`."
+            "Tap Confirm Trade below or type `confirm`."
         )
 
     return (
@@ -271,7 +335,11 @@ def render_sidebar(
 
         st.divider()
         st.header("Portfolio Today")
-        summary = engine.portfolio_summary_for_kid(positions_df, st.session_state.active_kid)
+        summary = engine.portfolio_summary_for_kid(
+            positions_df,
+            st.session_state.active_kid,
+            trades_df,
+        )
         day_change = engine.latest_day_change_for_kid(snapshots_df, st.session_state.active_kid)
 
         st.metric("Total Cost", money(summary["total_cost"]))
@@ -281,11 +349,13 @@ def render_sidebar(
             money(summary["unrealized_pnl"]),
             f"{summary['pnl_pct']:+.2f}%",
         )
+        st.metric("Realized P&L", money(summary["realized_pnl"]))
+        st.metric("Total P&L", money(summary["total_pnl"]))
         st.metric("Today Change", money(day_change))
 
         kid_positions = positions_df.loc[
             positions_df["kid"] == st.session_state.active_kid,
-            ["ticker", "shares", "market_value", "unrealized_pnl"],
+            ["ticker", "shares", "market_value", "unrealized_pnl", "realized_pnl"],
         ]
         st.caption("Open Positions")
         if kid_positions.empty:
@@ -295,6 +365,7 @@ def render_sidebar(
             display["shares"] = pd.to_numeric(display["shares"], errors="coerce").round(4)
             display["market_value"] = pd.to_numeric(display["market_value"], errors="coerce").round(2)
             display["unrealized_pnl"] = pd.to_numeric(display["unrealized_pnl"], errors="coerce").round(2)
+            display["realized_pnl"] = pd.to_numeric(display["realized_pnl"], errors="coerce").round(2)
             st.dataframe(display, hide_index=True, use_container_width=True)
 
 
@@ -335,24 +406,62 @@ def render_pending_trade_controls() -> None:
     if not pending:
         return
 
-    st.warning(
-        "Pending trade awaiting confirmation: "
-        f"{pending['action']} {pending['shares']:.4f} {pending['ticker']} @ ${pending['price']:.2f}"
+    st.markdown(
+        (
+            "<div class='pending-trade-card'>"
+            "<strong>Pending Trade Confirmation</strong><br>"
+            f"Kid: <strong>{pending['kid']}</strong><br>"
+            f"Action: <strong>{pending['action']}</strong><br>"
+            f"Ticker: <strong>{pending['ticker']}</strong><br>"
+            f"Shares: <strong>{pending['shares']:.4f}</strong><br>"
+            f"Price: <strong>${pending['price']:.2f}</strong>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
     )
     left, right = st.columns(2)
-    if left.button("Confirm Trade", type="primary"):
+    if left.button("Confirm Trade", type="primary", use_container_width=True, key="confirm_trade_button"):
         result = commit_pending_trade()
         add_chat_message("assistant", result)
         st.rerun()
-    if right.button("Cancel Trade"):
+    if right.button("Cancel Trade", use_container_width=True, key="cancel_trade_button"):
         st.session_state.pending_trade = None
         add_chat_message("assistant", "Cancelled. I did not save that trade.")
         st.rerun()
 
 
+def render_quick_actions() -> str:
+    st.markdown("<div class='quick-hint'>Quick prompts:</div>", unsafe_allow_html=True)
+    first, second, third = st.columns(3)
+
+    if first.button("Show Portfolio", key="quick_show_portfolio", use_container_width=True):
+        return "show my portfolio"
+    if second.button("Last 5 Trades", key="quick_last_trades", use_container_width=True):
+        return "show my last 5 trades"
+    if third.button("Refresh Prices", key="quick_refresh_prices", use_container_width=True):
+        return "refresh prices"
+    return ""
+
+
+def handle_prompt_submission(prompt: str) -> None:
+    add_chat_message("user", prompt)
+    trades_df = storage.load_trades()
+    prices_df = storage.load_prices()
+    positions_df, _ = recompute_and_persist_derived_data(trades_df, prices_df)
+    response = process_user_message(
+        text=prompt,
+        active_kid=st.session_state.active_kid,
+        trades_df=trades_df,
+        prices_df=prices_df,
+        positions_df=positions_df,
+    )
+    add_chat_message("assistant", response)
+
+
 def main() -> None:
     storage.ensure_data_files()
     init_session_state()
+    inject_global_styles()
 
     trades_df = storage.load_trades()
     prices_df = storage.load_prices()
@@ -372,21 +481,14 @@ def main() -> None:
             st.markdown(message["content"])
 
     render_pending_trade_controls()
+    quick_prompt = render_quick_actions()
+    if quick_prompt:
+        handle_prompt_submission(quick_prompt)
+        st.rerun()
 
     prompt = st.chat_input("Type a trade or ask about your portfolio")
     if prompt:
-        add_chat_message("user", prompt)
-        trades_df = storage.load_trades()
-        prices_df = storage.load_prices()
-        positions_df, _ = recompute_and_persist_derived_data(trades_df, prices_df)
-        response = process_user_message(
-            text=prompt,
-            active_kid=st.session_state.active_kid,
-            trades_df=trades_df,
-            prices_df=prices_df,
-            positions_df=positions_df,
-        )
-        add_chat_message("assistant", response)
+        handle_prompt_submission(prompt)
         st.rerun()
 
 

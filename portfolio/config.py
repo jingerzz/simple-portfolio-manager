@@ -36,6 +36,7 @@ POSITION_COLUMNS = [
     "market_price",
     "market_value",
     "unrealized_pnl",
+    "realized_pnl",
     "pnl_pct",
 ]
 

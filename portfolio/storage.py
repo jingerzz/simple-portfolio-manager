@@ -58,7 +58,15 @@ def load_positions() -> pd.DataFrame:
     frame["as_of"] = pd.to_datetime(frame["as_of"], utc=True, errors="coerce")
     frame["kid"] = frame["kid"].astype(str).str.strip()
     frame["ticker"] = frame["ticker"].astype(str).str.upper().str.strip()
-    for column in ("shares", "avg_cost", "market_price", "market_value", "unrealized_pnl", "pnl_pct"):
+    for column in (
+        "shares",
+        "avg_cost",
+        "market_price",
+        "market_value",
+        "unrealized_pnl",
+        "realized_pnl",
+        "pnl_pct",
+    ):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     return frame
 

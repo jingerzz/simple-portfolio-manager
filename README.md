@@ -9,8 +9,9 @@ Simple investing tracker for kids with chat-style trade entry and local CSV stor
 - Chat-first Streamlit interface for entering trades in plain English
 - Confirm/cancel trade workflow before any write to disk
 - Local CSV portfolio ledger (no Google Sheets dependency)
-- Price refresh using free market data via `yfinance`
-- Per-kid portfolio summary with unrealized P&L and daily change
+- Price refresh using free market data with fallback (`yfinance` -> `stooq`)
+- Per-kid portfolio summary with unrealized, realized, and total P&L
+- Kid-friendly quick prompt buttons for common actions
 
 ### Current scope
 
@@ -23,10 +24,13 @@ Simple investing tracker for kids with chat-style trade entry and local CSV stor
 - Chat input for trades: `I bought 2 AAPL at 185`
 - Confirmation required before writing a trade
 - Local CSV files for trades, prices, positions, and daily snapshots
-- Price refresh from `yfinance`
-- Per-kid portfolio view with daily P&L summary
+- Realized P&L tracking for sell trades (average-cost method)
+- Price refresh with fallback source support
+- Per-kid portfolio view with daily + realized P&L summary
 
 ## Quick start
+
+For a parent/kid-friendly walkthrough, see [QUICKSTART.md](QUICKSTART.md).
 
 1. Create a virtual environment and install dependencies:
    ```bash

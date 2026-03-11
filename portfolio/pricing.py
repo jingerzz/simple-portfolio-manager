@@ -1,14 +1,20 @@
+import csv
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from io import StringIO
 from typing import Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 VALIDATION_VALID = "valid"
 VALIDATION_INVALID = "invalid"
 VALIDATION_UNKNOWN = "unknown"
+
+SOURCE_YFINANCE = "yfinance"
+SOURCE_STOOQ = "stooq"
 
 US_EASTERN = ZoneInfo("America/New_York")
 
@@ -18,7 +24,27 @@ def fetch_latest_prices(tickers: Iterable[str]) -> Tuple[List[dict], List[str]]:
     if not normalized:
         return [], []
 
-    download_target = normalized[0] if len(normalized) == 1 else normalized
+    records: List[dict] = []
+    unresolved = normalized
+
+    try:
+        yf_records, unresolved = _fetch_from_yfinance(unresolved)
+        records.extend(yf_records)
+    except RuntimeError:
+        unresolved = normalized
+
+    if unresolved:
+        stooq_records, unresolved = _fetch_from_stooq(unresolved)
+        records.extend(stooq_records)
+
+    return records, unresolved
+
+
+def _fetch_from_yfinance(tickers: List[str]) -> Tuple[List[dict], List[str]]:
+    if not tickers:
+        return [], []
+
+    download_target = tickers[0] if len(tickers) == 1 else tickers
     try:
         raw = yf.download(
             tickers=download_target,
@@ -33,24 +59,79 @@ def fetch_latest_prices(tickers: Iterable[str]) -> Tuple[List[dict], List[str]]:
         raise RuntimeError(f"Unable to fetch prices from yfinance: {exc}") from exc
 
     as_of = datetime.now(timezone.utc).isoformat()
-    records: List[dict] = []
-    missing: List[str] = []
-
-    for ticker in normalized:
+    records = []
+    missing = []
+    for ticker in tickers:
         series = _extract_close_series(raw, ticker)
         price = _last_valid_price(series)
         if price is None:
             missing.append(ticker)
             continue
-        records.append(
-            {
-                "as_of": as_of,
-                "ticker": ticker,
-                "price": round(price, 4),
-                "source": "yfinance",
-            }
-        )
+        records.append(_price_record(as_of, ticker, price, SOURCE_YFINANCE))
     return records, missing
+
+
+def _fetch_from_stooq(tickers: List[str]) -> Tuple[List[dict], List[str]]:
+    if not tickers:
+        return [], []
+
+    as_of = datetime.now(timezone.utc).isoformat()
+    records = []
+    missing = []
+    for ticker in tickers:
+        price = _fetch_stooq_price(ticker)
+        if price is None:
+            missing.append(ticker)
+            continue
+        records.append(_price_record(as_of, ticker, price, SOURCE_STOOQ))
+    return records, missing
+
+
+def _fetch_stooq_price(ticker: str) -> Optional[float]:
+    for symbol in _stooq_symbol_candidates(ticker):
+        url = f"https://stooq.com/q/l/?s={symbol}&i=d"
+        try:
+            response = requests.get(url, timeout=6)
+            if response.status_code >= 400:
+                continue
+            reader = csv.DictReader(StringIO(response.text))
+            row = next(reader, None)
+            if not row:
+                continue
+            raw_close = (row.get("Close") or row.get("close") or "").strip()
+            if not raw_close or raw_close.upper() == "N/D":
+                continue
+            price = float(raw_close)
+            if price > 0:
+                return price
+        except (requests.RequestException, ValueError, TypeError):
+            continue
+    return None
+
+
+def _stooq_symbol_candidates(ticker: str) -> List[str]:
+    base = ticker.lower().strip()
+    if not base:
+        return []
+
+    variants = [base, base.replace("-", "."), base.replace(".", "-")]
+    symbols: List[str] = []
+    for variant in variants:
+        if variant not in symbols:
+            symbols.append(variant)
+        us_variant = f"{variant}.us"
+        if us_variant not in symbols:
+            symbols.append(us_variant)
+    return symbols
+
+
+def _price_record(as_of: str, ticker: str, price: float, source: str) -> dict:
+    return {
+        "as_of": as_of,
+        "ticker": ticker,
+        "price": round(price, 4),
+        "source": source,
+    }
 
 
 @lru_cache(maxsize=512)
